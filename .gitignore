@@ -73,6 +73,7 @@ yarn-debug.log
 
 # Ignore Docker option files
 docker-compose.override.yml
+compose.prod.yml
 
 # Ignore dotenv .local files
 .env*.local
@@ -82,3 +83,13 @@ docker-compose.override.yml
 
 *storybook.log
 storybook-static
+
+# Agent
+.agents/
+.claude/
+.gemini/
+tasks/
+AGENTS.md
+GEMINI.md
+CLAUDE.md
+CLAUDE.local.md

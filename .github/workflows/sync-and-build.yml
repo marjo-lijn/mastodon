@@ -1,0 +1,206 @@
+name: Sync upstream & Build Docker Image
+
+on:
+  schedule:
+    # JST 15:00 / 翌3:00 に相当（UTC 6:00 / 18:00）
+    - cron: '0 6,18 * * *'
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: '強制ビルドするタグ名 (例: kb23.1)。空白で自動検知。'
+        required: false
+        default: ''
+
+jobs:
+  detect:
+    name: 新タグ検出
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.check.outputs.new_tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+      is_latest: ${{ steps.check.outputs.is_latest }}
+
+    steps:
+      - name: Check for new upstream tags
+        id: check
+        env:
+          FORCE_TAG: ${{ github.event.inputs.force_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          # 強制ビルド指定がある場合
+          if [ -n "$FORCE_TAG" ]; then
+            echo "強制ビルド: $FORCE_TAG"
+            echo "new_tag=$FORCE_TAG" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            if [[ "$FORCE_TAG" != *"-lts"* ]]; then
+              echo "is_latest=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          # upstream (kmycode/mastodon) の最新リリースタグ一覧を取得
+          echo "=== upstream タグ取得 ==="
+          UPSTREAM_TAGS=$(curl -sf \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/kmycode/mastodon/releases?per_page=20" \
+            | jq -r '.[].tag_name')
+          echo "$UPSTREAM_TAGS"
+
+          # GHCR で既にビルド済みのタグ一覧を取得
+          # パッケージ名 mastodon/kmyblue は URL エンコード: mastodon%2Fkmyblue
+          echo "=== GHCR ビルド済みタグ取得 ==="
+          BUILT_TAGS=$(curl -sf \
+            -H "Authorization: Bearer $PAT_TOKEN" \
+            "https://api.github.com/users/$OWNER/packages/container/mastodon%2Fkmyblue/versions?per_page=100" \
+            | jq -r '.[].metadata.container.tags[]' 2>/dev/null || echo "")
+          echo "$BUILT_TAGS"
+
+          # 未ビルドの最新タグを1件検出
+          NEW_TAG=""
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            if ! echo "$BUILT_TAGS" | grep -qx "$tag"; then
+              NEW_TAG="$tag"
+              break
+            fi
+          done <<< "$UPSTREAM_TAGS"
+
+          if [ -n "$NEW_TAG" ]; then
+            echo "新しいタグを検出: $NEW_TAG"
+            echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            if [[ "$NEW_TAG" != *"-lts"* ]]; then
+              echo "is_latest=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "新しいタグなし。最新の状態です。"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  sync:
+    name: タグを fork に同期
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream tag to fork
+        env:
+          TAG: ${{ needs.detect.outputs.new_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/kmycode/mastodon.git
+          git fetch upstream "refs/tags/$TAG:refs/tags/$TAG" --no-tags
+
+          # タグが fork にまだなければ push
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "タグ $TAG は既に fork に存在します"
+          else
+            git push origin "refs/tags/$TAG"
+            echo "タグ $TAG を fork に push しました"
+          fi
+
+  build:
+    name: Docker イメージビルド (${{ matrix.name }})
+    needs: [detect, sync]
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: kmyblue
+            dockerfile: ./Dockerfile
+          - name: kmyblue-streaming
+            dockerfile: ./streaming/Dockerfile
+
+    steps:
+      - name: Checkout at tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.detect.outputs.new_tag }}
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine Docker tags
+        id: tags
+        env:
+          TAG: ${{ needs.detect.outputs.new_tag }}
+          IS_LATEST: ${{ needs.detect.outputs.is_latest }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/mastodon/${{ matrix.name }}
+        run: |
+          TAGS="${IMAGE}:${TAG}"
+          if [ "$IS_LATEST" = "true" ]; then
+            TAGS="${TAGS},${IMAGE}:latest"
+          else
+            TAGS="${TAGS},${IMAGE}:latest-lts"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "ビルドするタグ: $TAGS"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          build-args: |
+            MASTODON_VERSION_METADATA=kmyblue
+
+  release:
+    name: GitHub Release 作成
+    needs: [detect, build]
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.detect.outputs.new_tag }}
+          name: ${{ needs.detect.outputs.new_tag }}
+          body: |
+            ## Docker Images
+
+            ```
+            docker pull ghcr.io/${{ github.repository_owner }}/mastodon/kmyblue:${{ needs.detect.outputs.new_tag }}
+            docker pull ghcr.io/${{ github.repository_owner }}/mastodon/kmyblue-streaming:${{ needs.detect.outputs.new_tag }}
+            ```
+
+            [kmycode/mastodon ${{ needs.detect.outputs.new_tag }}](https://github.com/kmycode/mastodon/releases/tag/${{ needs.detect.outputs.new_tag }}) から自動ビルドされました。
+          make_latest: ${{ needs.detect.outputs.is_latest == 'true' && 'true' || 'false' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
