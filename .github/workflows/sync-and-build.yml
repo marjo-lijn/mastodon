@@ -11,6 +11,9 @@ on:
         required: false
         default: ''
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   detect:
     name: 新タグ検出
@@ -106,12 +109,16 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git remote add upstream https://github.com/kmycode/mastodon.git
-          git fetch upstream "refs/tags/$TAG:refs/tags/$TAG" --no-tags
+
+          # fork の fetch-depth: 0 で同名タグがローカルに存在する場合があるため + でforce指定
+          echo "upstream からタグを取得: $TAG"
+          git fetch upstream "+refs/tags/$TAG:refs/tags/$TAG" --no-tags
 
           # タグが fork にまだなければ push
           if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
             echo "タグ $TAG は既に fork に存在します"
           else
+            echo "タグ $TAG を fork に push します"
             git push origin "refs/tags/$TAG"
             echo "タグ $TAG を fork に push しました"
           fi
